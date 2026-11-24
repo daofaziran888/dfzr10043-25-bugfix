@@ -19,10 +19,11 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
-from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
 
 from app.services import service_for
 
@@ -145,115 +146,213 @@ def publish_flow_and_schedule(template_id: int, plan_payload: dict[str, Any]) ->
 
 # ── 链路2: 文件归集校验 → 采集批次确认 → 字段映射生效 → 数据落库 → 交接包消费 ─
 
+# 按上游来源（同一执行的同一归集内容）串行化，保证值班员重试与机器人补报
+# 同时发生时也只有一个执行者推进批次，恢复全程幂等。
+_batch_locks_guard = threading.Lock()
+_batch_locks: dict[str, threading.Lock] = {}
+
+
+@contextmanager
+def _batch_lock(source_key: str):
+    with _batch_locks_guard:
+        lock = _batch_locks.setdefault(source_key, threading.Lock())
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _file_fingerprint(fp: dict[str, Any]) -> str:
+    """文件内容指纹：优先采用显式校验值，否则按文件名称+字节大小计算。"""
+    explicit = str(fp.get("校验值") or "").strip()
+    if explicit:
+        return explicit
+    return _checksum(f"{fp.get('文件名称', '')}:{fp.get('字节大小', '')}")
+
+
+def _landing_watermark(batch_code: str) -> int:
+    """基于批次生成确定性水位：同一批次恢复得到相同水位，保持单调可复算。"""
+    return 1_700_000_000 + int(_checksum(batch_code), 16) % 100_000_000
+
+
+def _rollback_new_files(file_svc, created_ids: set[int]) -> None:
+    """判重拦截时回滚本次调用新建的归集文件，复用文件保持不动。"""
+    if created_ids:
+        file_svc.remove_entries(created_ids)
+
+
 def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]],
-                                 mapping_ids: list[int]) -> dict[str, Any]:
-    """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。"""
+                                 mapping_ids: list[int],
+                                 fail_point: str | None = None) -> dict[str, Any]:
+    """归集流程执行产生的文件，确认采集批次后落库并打包交接。
+
+    全流程按阶段幂等、可恢复：
+    - 同一执行重传同一份内容只计入一组归集文件（按内容指纹复用，不新增）；
+    - 批次确认后落库中断时，重放按上游来源找回原批次并补齐落库回执，
+      不新建批次、不重复落库、不重复签收交接；
+    - fail_point="landing" 模拟批次确认后落库中断，用于恢复演练。
+    """
     run_entry = _find_entry("flow_run", run_id)
+    run_code = run_entry.get("执行编号", "")
+    source_key = f"{run_code}:{run_id}"
 
-    # 文件归集
+    with _batch_lock(source_key):
+        return _collect_and_land_locked(
+            run_id, run_entry, run_code, source_key, file_payloads,
+            mapping_ids, fail_point,
+        )
+
+
+def _collect_and_land_locked(run_id, run_entry, run_code, source_key,
+                             file_payloads, mapping_ids, fail_point):
     file_svc = service_for("file_drop")
-    collected = []
-    for fp in file_payloads:
-        file_values = {
-            "归集编号": fp.get("归集编号", f"FILE-R{run_id}"),
-            "关联执行": run_entry.get("执行编号", ""),
-            "文件名称": fp.get("文件名称", "capture_output.csv"),
-            "文件类型": fp.get("文件类型", "text/csv"),
-            "字节大小": fp.get("字节大小", "1024"),
-            "校验值": fp.get("校验值", _checksum(fp.get("文件名称", ""))),
-            "归集目录": fp.get("归集目录", f"/captures/run_{run_id}"),
-            "归集时间": _now_iso(),
-        }
-        result, _ = file_svc.create_entry(file_values)
-        file_svc.run_action(result["id"], "触发归集")
-        # 校验文件
-        if fp.get("校验值") and fp["校验值"] != _checksum(fp.get("文件名称", "")):
-            file_svc.run_action(result["id"], "校验文件")
-        collected.append(result)
-
-    # 创建采集批次
     batch_svc = service_for("capture_batch")
-    batch_payload = "\n".join(
-        fp.get("文件名称", "") for fp in file_payloads
-    )
+    landing_svc = service_for("data_landing")
+    handoff_svc = service_for("handoff_pack")
+
+    # ── 阶段1：幂等文件归集（先登记文件，再判批次，避免判重误增归集文件）──
+    batch_payload = "\n".join(fp.get("文件名称", "") for fp in file_payloads)
     batch_checksum = _checksum(batch_payload)
+    batch_code = f"CAPT-R{run_id}"
+    now_iso = _now_iso()
 
-    # 去重：按采集窗口+上游来源判重，重复批次不落库
-    existing = batch_svc.list_entries(size=10000)[0]
-    dup_check = f"{run_entry.get('执行编号')}:{run_id}"
-    duplicate = any(
-        e.get("上游来源") == dup_check
-        for e in existing
-    )
-    if duplicate:
+    fingerprints = [_file_fingerprint(fp) for fp in file_payloads]
+    collected: list[dict[str, Any]] = []
+    created_ids: set[int] = set()
+    reused_files = 0
+    for index, (fp, fingerprint) in enumerate(zip(file_payloads, fingerprints), start=1):
+        record, reused = file_svc.register_collected(
+            run_code=run_code,
+            file_payload=fp,
+            fingerprint=fingerprint,
+            batch_code=batch_code,
+            sequence=index,
+            now_iso=now_iso,
+            run_id=run_id,
+        )
+        collected.append(record)
+        if reused:
+            reused_files += 1
+        else:
+            created_ids.add(record["id"])
+
+    # ── 阶段2：批次确认（已存在则恢复，不新建批次；不同内容仍按来源判重拦截）──
+    batch = batch_svc.find_by_source(source_key)
+    recovered = batch is not None
+    if batch is not None and batch.get("完整性校验") != batch_checksum:
+        # 同一执行来源重传了不同内容：判重拦截，并回滚本次预登记的新归集文件
+        _rollback_new_files(file_svc, created_ids)
         return {"status": "duplicate", "reason": "采集窗口与上游来源重复，批次已存在"}
+    if batch is None:
+        batch_values = {
+            "批次编号": batch_code,
+            "关联执行": run_code,
+            "记录行数": str(len(collected)),
+            "采集窗口": f"[{now_iso[:10]}]",
+            "完整性校验": batch_checksum,
+            "批次标签": "file-collect",
+            "上游来源": source_key,
+            "生成时间": now_iso,
+        }
+        batch, _ = batch_svc.create_entry(batch_values)
+        batch_svc.run_action(batch["id"], "启动校验")
+        batch_svc.run_action(batch["id"], "确认批次")
 
-    batch_values = {
-        "批次编号": f"CAPT-R{run_id}",
-        "关联执行": run_entry.get("执行编号", ""),
-        "记录行数": str(len(collected)),
-        "采集窗口": f"[{_now_iso()[:10]}]",
-        "完整性校验": batch_checksum,
-        "批次标签": "file-collect",
-        "上游来源": dup_check,
-        "生成时间": _now_iso(),
-    }
-    batch_result, _ = batch_svc.create_entry(batch_values)
-    batch_svc.run_action(batch_result["id"], "启动校验")
-    batch_svc.run_action(batch_result["id"], "确认批次")
+    # 恢复路径：把已归集文件重新挂回原批次，保证批次列表可回查文件关联
+    for record in collected:
+        if not record.get("归集批次"):
+            record["归集批次"] = batch_code
 
-    # 字段映射生效
+    # ── 阶段3：字段映射生效（重复生效保持幂等）──
     mapping_svc = service_for("field_mapping")
     for mid in mapping_ids:
-        mapping_svc.run_action(mid, "提交试算")
+        mapping = mapping_svc.get_entry(mid)
+        if mapping is None:
+            continue
+        if mapping.get("status") != "试算中":
+            mapping_svc.run_action(mid, "提交试算")
         mapping_svc.run_action(mid, "生效映射")
 
-    # 数据落库（含水位推进）
-    landing_svc = service_for("data_landing")
-    # 模拟冲突行处理
-    raw_row_count = len(collected) * 10
-    conflict_rows = max(0, raw_row_count % 3)  # 模拟冲突
-    watermark = int(datetime.now(timezone(timedelta(hours=8))).timestamp())
-    landing_values = {
-        "落库编号": f"LAND-R{run_id}",
-        "关联批次": batch_values["批次编号"],
-        "目标存储": "datalake_rpa_collect",
-        "写入模式": "upsert",
-        "写入行数": str(raw_row_count),
-        "冲突行数": str(conflict_rows),
-        "落库水位": str(watermark),
-        "完成时间": _now_iso(),
-    }
-    landing_result, _ = landing_svc.create_entry(landing_values)
-    landing_svc.run_action(landing_result["id"], "启动写入")
-    if conflict_rows == 0:
-        landing_svc.run_action(landing_result["id"], "确认写入")
-    else:
-        landing_svc.run_action(landing_result["id"], "标记异常")
+    # ── 阶段4：数据落库（中断可恢复，成功后只产出一份回执）──
+    landing = landing_svc.get_by_batch(batch_code)
+    receipt = landing_svc.get_success_receipt(batch_code)
+    if receipt is None:
+        raw_row_count = len(collected) * 10
+        conflict_rows = max(0, raw_row_count % 3)  # 模拟冲突行，upsert 后仍成功写入
+        watermark = _landing_watermark(batch_code)
+        if landing is None:
+            landing_values = {
+                "落库编号": f"LAND-R{run_id}",
+                "关联批次": batch_code,
+                "目标存储": "datalake_rpa_collect",
+                "写入模式": "upsert",
+                "写入行数": str(raw_row_count),
+                "冲突行数": str(conflict_rows),
+                "落库水位": str(watermark),
+                "完成时间": "",
+                "落库回执": "",
+                "恢复次数": "0",
+            }
+            landing, _ = landing_svc.create_entry(landing_values)
+        else:
+            # 中断恢复：累计恢复次数，沿用原落库记录，不新建第二条
+            landing_svc.mark_recovered(landing["id"])
 
-    # 交接包打包
-    handoff_svc = service_for("handoff_pack")
-    handoff_values = {
-        "交接编号": f"HAND-R{run_id}",
-        "关联批次": batch_values["批次编号"],
-        "目标系统": "datalake_downstream",
-        "清单文件数": str(len(collected)),
-        "记录行数": str(raw_row_count - conflict_rows),
-        "校验摘要": batch_checksum,
-        "交接版本": "v1",
-        "交接时间": _now_iso(),
-    }
-    handoff_result, _ = handoff_svc.create_entry(handoff_values)
-    handoff_svc.run_action(handoff_result["id"], "启动打包")
-    handoff_svc.run_action(handoff_result["id"], "确认交接")
+        landing_svc.run_action(landing["id"], "启动写入")
+
+        # 演练：批次已确认、落库进行中时中断，尚无成功回执
+        if fail_point == "landing":
+            return {
+                "status": "landing_interrupted",
+                "batch_id": batch["id"],
+                "landing_id": landing["id"],
+                "reason": "落库中断，尚未产生成功回执",
+                "recovered": recovered,
+            }
+
+        # 冲突行按 upsert 处理后仍完成写入，生成确定性回执（恢复得到同一份）
+        landing["冲突行数"] = str(conflict_rows)
+        landing["落库水位"] = str(watermark)
+        landing["完成时间"] = now_iso
+        landing["落库回执"] = landing_svc.build_receipt_no(batch_code)
+        landing_svc.run_action(landing["id"], "确认写入")
+        receipt = landing_svc.get_success_receipt(batch_code)
+
+    # ── 阶段5：交接包（凭回执交付，清单对账，重复确认不重复签收）──
+    handoff = None
+    packs = handoff_svc.get_by_batch(batch_code)
+    if packs:
+        handoff = packs[0]
+    else:
+        handoff_values = {
+            "交接编号": f"HAND-R{run_id}",
+            "关联批次": batch_code,
+            "目标系统": "datalake_downstream",
+            "清单文件数": str(len(collected)),
+            "记录行数": str(receipt["written_rows"]),
+            "校验摘要": batch_checksum,
+            "交接版本": "v1",
+            "交接时间": now_iso,
+            "落库回执": "",
+        }
+        handoff, _ = handoff_svc.create_entry(handoff_values)
+        handoff_svc.run_action(handoff["id"], "启动打包")
+
+    delivery = handoff_svc.confirm_delivery(handoff["id"])
 
     return {
         "status": "landed",
-        "batch_id": batch_result["id"],
-        "landing_id": landing_result["id"],
-        "handoff_id": handoff_result["id"],
-        "conflict_rows": conflict_rows,
-        "watermark": watermark,
+        "batch_id": batch["id"],
+        "landing_id": landing["id"],
+        "handoff_id": handoff["id"],
+        "receipt_no": receipt["receipt_no"],
+        "watermark": receipt["watermark"],
+        "conflict_rows": int(landing.get("冲突行数", "0") or "0"),
+        "collected_files": len(collected),
+        "reused_files": reused_files,
+        "recovered": recovered,
+        "delivery": delivery,
     }
 
 

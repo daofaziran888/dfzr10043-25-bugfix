@@ -32,6 +32,23 @@ class CaptureBatchService(BaseModuleService):
                 return it
         return None
 
+    def find_by_source(self, source: str) -> dict[str, Any] | None:
+        """按上游来源（执行实例判重键）找回批次，落库中断恢复时复用原批次。"""
+        items, _ = self.list_entries(size=10000)
+        for it in items:
+            if it.get("上游来源") == source:
+                return it
+        return None
+
+    def list_batch_files(self, batch_id: int) -> list[dict[str, Any]]:
+        """回查批次关联的归集文件，批次确认后仍可追溯文件关联。"""
+        entry = self.get_entry(batch_id)
+        if entry is None:
+            return []
+        from app.services import service_for
+        file_svc = service_for("file_drop")
+        return file_svc.get_files_by_batch(entry.get("批次编号", ""))
+
     def get_confirmed_batches(self) -> list[dict[str, Any]]:
         """获取所有已确认的采集批次，供下游交接打包。"""
         items, _ = self.list_entries(size=10000)

@@ -95,20 +95,52 @@ class TestPipelineLink2_CollectLandHandoff:
         assert result["handoff_id"] > 0
         assert result["watermark"] > 0
 
-    def test_dedup_rejects_duplicate_batch(self):
+    def test_same_content_replay_is_idempotent_recovery(self):
+        """同执行重传同一份内容：恢复原批次，不新建批次/文件，回执保持同一份。"""
         run_svc = service_for("flow_run")
         all_runs = run_svc.list_entries(size=1000)[0]
         run_id = all_runs[0]["id"]
-        first = collect_files_and_land_data(run_id, [
+        payload = [
             {"文件名称": "dedup_test.csv", "文件类型": "text/csv", "字节大小": "512"},
+        ]
+        first = collect_files_and_land_data(run_id, payload, [])
+        second = collect_files_and_land_data(run_id, payload, [])
+        assert first["status"] == "landed"
+        assert second["status"] == "landed"
+        # 同一批次、同一份落库回执、同一交接包
+        assert second["batch_id"] == first["batch_id"]
+        assert second["landing_id"] == first["landing_id"]
+        assert second["handoff_id"] == first["handoff_id"]
+        assert second["receipt_no"] == first["receipt_no"]
+        # 重放只复用归集文件，不新增
+        assert second["reused_files"] == 1
+        file_svc = service_for("file_drop")
+        run_code = run_svc.get_entry(run_id)["执行编号"]
+        matched = [f for f in file_svc.get_files_by_run(run_code)
+                   if f["文件名称"] == "dedup_test.csv"]
+        assert len(matched) == 1
+
+    def test_different_content_same_source_still_rejected(self):
+        """同一执行来源的不同归集内容仍按窗口去重拦截，不落第二条批次。"""
+        run_svc = service_for("flow_run")
+        all_runs = run_svc.list_entries(size=1000)[0]
+        run_id = all_runs[1]["id"]
+        first = collect_files_and_land_data(run_id, [
+            {"文件名称": "source_a.csv", "文件类型": "text/csv", "字节大小": "512"},
         ], [])
         second = collect_files_and_land_data(run_id, [
-            {"文件名称": "dedup_test.csv", "文件类型": "text/csv", "字节大小": "512"},
+            {"文件名称": "source_b.csv", "文件类型": "text/csv", "字节大小": "256"},
         ], [])
-        assert first["status"] == "landed" if "landing_id" in first else first["status"] == "landed"
+        assert first["status"] == "landed"
         assert second["status"] == "duplicate"
+        # 判重拦截不得在文件归集页面留下第二条内容的文件
+        run_code = run_svc.get_entry(run_id)["执行编号"]
+        names = {f["文件名称"] for f in
+                 service_for("file_drop").get_files_by_run(run_code)}
+        assert names == {"source_a.csv"}
 
-    def test_conflict_rows_lead_to_landing_exception(self):
+    def test_conflict_rows_upsert_and_still_land_with_receipt(self):
+        """冲突行按 upsert 处理后仍完成写入并产出回执，可正常交接。"""
         run_svc = service_for("flow_run")
         all_runs = run_svc.list_entries(size=1000)[0]
         run_id = all_runs[0]["id"]
@@ -116,10 +148,11 @@ class TestPipelineLink2_CollectLandHandoff:
             {"文件名称": "conflict_test.csv", "文件类型": "text/csv", "字节大小": "3072"},
             {"文件名称": "conflict_test2.csv", "文件类型": "text/csv", "字节大小": "1024"},
         ], [])
-        if "conflict_rows" in result and result["conflict_rows"] > 0:
+        if result["conflict_rows"] > 0:
             landing_svc = service_for("data_landing")
             landing = landing_svc.get_entry(result["landing_id"])
-            assert landing["status"] == "写入异常"
+            assert landing["status"] == "已写入"
+            assert landing["落库回执"] == result["receipt_no"]
 
 
 class TestPipelineLink3_CredentialRotation:
@@ -270,10 +303,12 @@ class TestDedupDomainLogic:
 
     def test_dedup_by_window_removes_duplicates(self):
         from app.dedup import dedup_by_window
+        from datetime import datetime, timedelta, timezone
+        today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
         rows = [
-            {"id": 1, "key": "a", "生成时间": "2026-11-21T00:00:00"},
-            {"id": 2, "key": "a", "生成时间": "2026-11-21T00:00:00"},
-            {"id": 3, "key": "b", "生成时间": "2026-11-21T00:00:00"},
+            {"id": 1, "key": "a", "生成时间": f"{today}T00:00:00"},
+            {"id": 2, "key": "a", "生成时间": f"{today}T00:00:00"},
+            {"id": 3, "key": "b", "生成时间": f"{today}T00:00:00"},
         ]
         result = dedup_by_window(rows, ["key"])
         assert len(result) == 2
